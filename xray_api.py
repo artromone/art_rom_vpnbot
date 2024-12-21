@@ -4,7 +4,7 @@ import logging
 import uuid
 
 class XRayAPI:
-    def __init__(self, config_path="/root/github-repo/art_rom_vpnbot/config.json"):
+    def __init__(self, config_path="/usr/local/etc/xray/config.json"):
         self.config_path = config_path
         self.load_config()
 
