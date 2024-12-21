@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  vpn-bot:
+    build: .
+    restart: always
+    env_file: .env
+    networks:
+      - vpn-network
+
+networks:
+  vpn-network:
+    external: true
+
