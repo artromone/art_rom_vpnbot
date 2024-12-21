@@ -44,6 +44,6 @@ class XRayAPI:
     def restart_xray(self):
         # Пример перезапуска XRay через системный вызов
         try:
-            os.system("systemctl restart xray")  # Замените на нужную команду для вашего окружения
+            os.system("bash /usr/local/etc/xray/restart.bash")  # Замените на нужную команду для вашего окружения
         except Exception as e:
             logging.error(f"Ошибка при перезапуске XRay: {e}")
