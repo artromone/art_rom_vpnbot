@@ -4,7 +4,7 @@ import logging
 import uuid
 
 class XRayAPI:
-    def __init__(self, config_path="config.json"):
+    def __init__(self, config_path="/root/github-repo/art_rom_vpnbot/config.json"):
         self.config_path = config_path
         self.load_config()
 
@@ -47,39 +47,3 @@ class XRayAPI:
             os.system("systemctl restart xray")  # Замените на нужную команду для вашего окружения
         except Exception as e:
             logging.error(f"Ошибка при перезапуске XRay: {e}")
-
-    def handle_message(self, message):
-        if message.text != "Получить VPN":
-            return
-
-        user_id = message.from_user.id
-
-        if not self.check_subscription(user_id):
-            self.bot.send_message(
-                message.chat.id,
-                "Сначала подпишитесь на канал:\n\n"
-                f"[ПОДПИСАТЬСЯ](https://t.me/{CHANNEL_ID.lstrip('@')})",
-                parse_mode='Markdown'
-            )
-            return
-
-        # Add client to XRay
-        client = self.add_client(user_id)
-        if not client:
-            self.bot.send_message(
-                message.chat.id,
-                "Произошла ошибка при создании VPN. Попробуйте позже."
-            )
-            return
-
-        # Send configuration instructions
-        self.bot.send_message(
-            message.chat.id,
-            NEKORAY_INSTRUCTIONS.format(
-                server_address="your-domain.com",  # Configure in .env
-                server_port=443,                   # Configure in .env
-                uuid=client['id'],
-                ws_path="/websocket"              # Configure in .env
-            ),
-            disable_web_page_preview=True
-        )
