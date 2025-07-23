@@ -1,4 +1,4 @@
-module art_rom_vpn
+module xray-telegram-bot
 
 go 1.23.6
 
