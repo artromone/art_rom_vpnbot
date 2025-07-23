@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log"
 	"math/rand"
 	"os"
+	"os/exec"
 	"sync"
 	"time"
 
@@ -16,12 +19,32 @@ import (
 
 const (
 	channelUsername = "@art_rom" // Замените на @username вашего канала
+	xrayAPIAddress  = "127.0.0.1:10085"
+	xrayTag         = "vless_tls"
+	serverDomain    = "artr.ignorelist.com"
+	serverPort      = 443
+	configPath      = "/usr/local/etc/xray/config.json"
 )
 
 var (
 	db   *sql.DB
 	dbMu sync.Mutex // Мьютекс для синхронизации доступа к базе данных
 )
+
+// Структуры для работы с Xray
+type XrayUser struct {
+	Email string `json:"email"`
+	ID    string `json:"id"`
+	Flow  string `json:"flow"`
+}
+
+type XrayConfig struct {
+	Log       interface{}   `json:"log"`
+	Routing   interface{}   `json:"routing"`
+	Inbounds  []interface{} `json:"inbounds"`
+	Outbounds []interface{} `json:"outbounds"`
+	API       interface{}   `json:"api,omitempty"`
+}
 
 func main() {
 	// Инициализация базы данных
@@ -38,6 +61,12 @@ func main() {
 
 	// Создание таблицы пользователей
 	createTable()
+
+	// Инициализация Xray API (если еще не настроен)
+	if err := initXrayAPI(); err != nil {
+		log.Printf("Warning: Failed to initialize Xray API: %v", err)
+		log.Println("Please ensure Xray API is properly configured")
+	}
 
 	// Инициализация бота
 	bot, err := tgbotapi.NewBotAPI(os.Getenv("TELEGRAM_BOT_TOKEN"))
@@ -73,7 +102,7 @@ func handleMessage(bot *tgbotapi.BotAPI, update tgbotapi.Update) {
 
 	// Обработка команды /start
 	if update.Message.Text == "/start" {
-		msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Привет! Я бот для проверки подписки. Используйте /check для проверки подписки и получения UUID.")
+		msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Привет! Я бот для проверки подписки. Используйте /check для проверки подписки и получения конфигурации VPN.")
 		bot.Send(msg)
 		return
 	}
@@ -90,19 +119,25 @@ func handleMessage(bot *tgbotapi.BotAPI, update tgbotapi.Update) {
 		}
 
 		if isSubscribed {
-			// Генерируем или получаем существующий UUID
-			userUUID, err := getOrCreateUUID(userID, username)
+			// Генерируем или получаем существующий UUID и добавляем в Xray
+			userUUID, vlessURL, err := getOrCreateVlessConfig(userID, username)
 			if err != nil {
-				log.Printf("Error generating UUID: %v", err)
-				msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Произошла ошибка при генерации UUID. Пожалуйста, попробуйте позже.")
+				log.Printf("Error generating VLESS config: %v", err)
+				msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Произошла ошибка при генерации конфигурации. Пожалуйста, попробуйте позже.")
 				bot.Send(msg)
 				return
 			}
 
-			msg := tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Вы подписаны на канал! Ваш UUID: %s", userUUID))
+			responseText := fmt.Sprintf("Вы подписаны на канал! \n\nВаш UUID: `%s`\n\nВаша VLESS конфигурация:\n`%s`", userUUID, vlessURL)
+			msg := tgbotapi.NewMessage(update.Message.Chat.ID, responseText)
+			msg.ParseMode = "Markdown"
 			bot.Send(msg)
 		} else {
-			// Если пользователь не подписан, удаляем его из базы, если он там есть
+			// Если пользователь не подписан, удаляем его из Xray и базы
+			if err := removeUserFromXray(userID); err != nil {
+				log.Printf("Error removing user %d from Xray: %v", userID, err)
+			}
+
 			dbMu.Lock()
 			_, err := db.Exec("DELETE FROM users WHERE user_id = ?", userID)
 			dbMu.Unlock()
@@ -117,7 +152,7 @@ func handleMessage(bot *tgbotapi.BotAPI, update tgbotapi.Update) {
 	}
 
 	// Обработка других сообщений
-	msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Используйте /check для проверки подписки и получения UUID.")
+	msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Используйте /check для проверки подписки и получения конфигурации VPN.")
 	bot.Send(msg)
 }
 
@@ -157,7 +192,7 @@ func checkSubscription(bot *tgbotapi.BotAPI, userID int64, channelUsername strin
 	return member.Status == "member" || member.Status == "administrator" || member.Status == "creator", nil
 }
 
-func getOrCreateUUID(userID int64, username string) (string, error) {
+func getOrCreateVlessConfig(userID int64, username string) (string, string, error) {
 	var userUUID string
 
 	dbMu.Lock()
@@ -166,17 +201,24 @@ func getOrCreateUUID(userID int64, username string) (string, error) {
 	// Проверяем, есть ли уже UUID для пользователя
 	err := db.QueryRow("SELECT uuid FROM users WHERE user_id = ?", userID).Scan(&userUUID)
 	if err == nil {
-		// UUID уже существует
-		return userUUID, nil
+		// UUID уже существует, генерируем VLESS URL
+		vlessURL := generateVlessURL(userUUID, fmt.Sprintf("user_%d", userID))
+		return userUUID, vlessURL, nil
 	}
 
 	if err != sql.ErrNoRows {
 		// Произошла ошибка при запросе
-		return "", err
+		return "", "", err
 	}
 
 	// Генерируем новый UUID
 	userUUID = uuid.New().String()
+	email := fmt.Sprintf("user_%d@myserver", userID)
+
+	// Добавляем пользователя в Xray
+	if err := addUserToXray(userUUID, email); err != nil {
+		return "", "", fmt.Errorf("failed to add user to Xray: %v", err)
+	}
 
 	// Сохраняем пользователя в БД
 	_, err = db.Exec(
@@ -184,10 +226,13 @@ func getOrCreateUUID(userID int64, username string) (string, error) {
 		userID, username, userUUID, time.Now(),
 	)
 	if err != nil {
-		return "", err
+		// Если не удалось сохранить в БД, удаляем из Xray
+		removeUserFromXrayByEmail(email)
+		return "", "", err
 	}
 
-	return userUUID, nil
+	vlessURL := generateVlessURL(userUUID, email)
+	return userUUID, vlessURL, nil
 }
 
 func checkSubscriptionsRoutine(bot *tgbotapi.BotAPI) {
@@ -195,7 +240,7 @@ func checkSubscriptionsRoutine(bot *tgbotapi.BotAPI) {
 	for {
 		// Случайная задержка от 1 до 24 часов (для тестирования используем секунды)
 		sleepHours := rand.Intn(23) + 1
-		// time.Sleep(time.Duration(sleepHours) * time.Minute)
+		// time.Sleep(time.Duration(sleepHours) * time.Hour)
 		time.Sleep(time.Duration(sleepHours) * time.Second)
 
 		log.Println("Starting subscription check for all users...")
@@ -235,8 +280,14 @@ func checkSubscriptionsRoutine(bot *tgbotapi.BotAPI) {
 				continue
 			}
 
-			// Если пользователь отписался, удаляем его из базы и отправляем уведомление
+			// Если пользователь отписался, удаляем его из базы и Xray
 			if !isSubscribed {
+				// Удаляем из Xray
+				if err := removeUserFromXray(user.ID); err != nil {
+					log.Printf("Error removing user %d from Xray: %v", user.ID, err)
+				}
+
+				// Удаляем из базы данных
 				dbMu.Lock()
 				_, err := db.Exec("DELETE FROM users WHERE user_id = ?", user.ID)
 				dbMu.Unlock()
@@ -247,7 +298,7 @@ func checkSubscriptionsRoutine(bot *tgbotapi.BotAPI) {
 
 					// Отправляем сообщение пользователю об отписке
 					msg := tgbotapi.NewMessage(user.ID, fmt.Sprintf(
-						"Вы отписались от канала %s. Ваш доступ к сервису был аннулирован. Чтобы восстановить доступ, подпишитесь на канал и используйте команду /check.",
+						"Вы отписались от канала %s. Ваш доступ к VPN был аннулирован. Чтобы восстановить доступ, подпишитесь на канал и используйте команду /check.",
 						channelUsername))
 
 					if _, err := bot.Send(msg); err != nil {
@@ -261,4 +312,178 @@ func checkSubscriptionsRoutine(bot *tgbotapi.BotAPI) {
 
 		log.Println("Subscription check completed")
 	}
+}
+
+// Xray API functions
+
+func initXrayAPI() error {
+	// Проверяем, есть ли уже API в конфигурации
+	config, err := readXrayConfig()
+	if err != nil {
+		return err
+	}
+
+	// Если API уже настроен, ничего не делаем
+	if config.API != nil {
+		return nil
+	}
+
+	log.Println("Adding API configuration to Xray config...")
+
+	// Добавляем API конфигурацию
+	config.API = map[string]interface{}{
+		"tag": "api",
+		"services": []string{
+			"HandlerService",
+			"StatsService",
+		},
+	}
+
+	// Добавляем API inbound
+	apiInbound := map[string]interface{}{
+		"listen":   "127.0.0.1",
+		"port":     10085,
+		"protocol": "dokodemo-door",
+		"settings": map[string]interface{}{
+			"address": "127.0.0.1",
+		},
+		"tag": "api",
+	}
+
+	config.Inbounds = append(config.Inbounds, apiInbound)
+
+	// Добавляем правило маршрутизации для API
+	routing, ok := config.Routing.(map[string]interface{})
+	if !ok {
+		routing = make(map[string]interface{})
+		config.Routing = routing
+	}
+	rules, ok := routing["rules"].([]interface{})
+	if !ok {
+		rules = []interface{}{}
+	}
+
+	apiRule := map[string]interface{}{
+		"inboundTag":  []string{"api"},
+		"outboundTag": "api",
+		"type":        "field",
+	}
+
+	rules = append(rules, apiRule)
+	routing["rules"] = rules
+
+	// Добавляем API outbound
+	apiOutbound := map[string]interface{}{
+		"protocol": "freedom",
+		"tag":      "api",
+	}
+
+	config.Outbounds = append(config.Outbounds, apiOutbound)
+
+	// Сохраняем конфигурацию
+	if err := writeXrayConfig(config); err != nil {
+		return err
+	}
+
+	log.Println("API configuration added. Please restart Xray manually to apply changes.")
+	return nil
+}
+
+func readXrayConfig() (*XrayConfig, error) {
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return nil, err
+	}
+
+	var config XrayConfig
+	err = json.Unmarshal(data, &config)
+	if err != nil {
+		return nil, err
+	}
+
+	return &config, nil
+}
+
+func writeXrayConfig(config *XrayConfig) error {
+	data, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(configPath, data, 0644)
+}
+
+func addUserToXray(userUUID, email string) error {
+	user := XrayUser{
+		Email: email,
+		ID:    userUUID,
+		Flow:  "xtls-rprx-vision",
+	}
+
+	userJSON, err := json.Marshal(user)
+	if err != nil {
+		return err
+	}
+
+	cmd := exec.Command("xray", "api", "inbounduser",
+		"-s", xrayAPIAddress,
+		"-tag", xrayTag,
+		"-operation", "add",
+		"-user", string(userJSON))
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to add user to Xray: %v, output: %s", err, string(output))
+	}
+
+	log.Printf("User %s added to Xray successfully", email)
+	return nil
+}
+
+func removeUserFromXray(userID int64) error {
+	email := fmt.Sprintf("user_%d@myserver", userID)
+	return removeUserFromXrayByEmail(email)
+}
+
+func removeUserFromXrayByEmail(email string) error {
+	cmd := exec.Command("xray", "api", "inbounduser",
+		"-s", xrayAPIAddress,
+		"-tag", xrayTag,
+		"-operation", "remove",
+		"-email", email)
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to remove user from Xray: %v, output: %s", err, string(output))
+	}
+
+	log.Printf("User %s removed from Xray successfully", email)
+	return nil
+}
+
+func generateVlessURL(userUUID, name string) string {
+	return fmt.Sprintf("vless://%s@%s:%d?security=tls&type=tcp&flow=xtls-rprx-vision&encryption=none#%s",
+		userUUID, serverDomain, serverPort, name)
+}
+
+func listXrayUsers() ([]XrayUser, error) {
+	cmd := exec.Command("xray", "api", "inbounduser",
+		"-s", xrayAPIAddress,
+		"-tag", xrayTag)
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list Xray users: %v, stderr: %s", err, stderr.String())
+	}
+
+	// Парсим вывод (формат может отличаться в зависимости от версии Xray)
+	var users []XrayUser
+	// Здесь нужно будет добавить парсинг JSON ответа от Xray API
+	// Формат ответа зависит от конкретной версии Xray
+
+	return users, nil
 }
